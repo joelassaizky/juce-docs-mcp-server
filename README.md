@@ -1,126 +1,107 @@
-# juce-docs-mcp-server
+# JUCE Docs MCP Server
 
-An [MCP](https://modelcontextprotocol.io/) server that gives AI coding assistants access to [JUCE](https://juce.com/) Framework C++ class documentation. Ask your assistant about any JUCE class and it can look up the real docs instead of guessing.
+An MCP server that gives Codex and other compatible clients version-matched
+JUCE class documentation plus bounded access to a local JUCE source checkout.
 
-Fork of [josmithiii/mcp-servers-jos](https://github.com/josmithiii/mcp-servers-jos) with runtime docs-source switching and local JUCE docs support.
+This fork refreshes the original
+[juce-docs-mcp-server](https://github.com/danielraffel/juce-docs-mcp-server)
+for the current MCP SDK and JUCE 9 workflows.
 
-## What it does
+## Capabilities
 
-- **Search** JUCE classes by name (`search-juce-classes`)
-- **Fetch** full class documentation with methods, parameters, and descriptions (`get-juce-class-docs`)
-- **Browse** all available classes (`juce://classes` resource)
-- **Switch docs sources** at runtime — official hosted docs (master/develop), a custom URL, or a local JUCE checkout
-- **Explore** JUCE interactively with the `explore-juce` prompt (e.g. `explore-juce audio`)
+- Search JUCE classes by name.
+- Read full Doxygen class documentation.
+- Search methods and documented properties within a class.
+- Search exact text in a configured local JUCE source tree.
+- Read bounded line ranges from local JUCE C/C++/Objective-C source files.
+- Switch between official master/develop docs, custom hosted docs, and
+  generated documentation from a local JUCE checkout.
 
-## Quick setup
+The local source tools are intentionally read-only. Paths are constrained to
+the configured JUCE checkout, source-file types are allow-listed, reads are
+limited to 4 MiB, and excerpts are capped at 400 lines.
+
+## Requirements
+
+- Node.js 20.18.1 or newer.
+- Doxygen and Python only when generating local documentation.
+
+## Build and test
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/danielraffel/juce-docs-mcp-server.git
-cd juce-docs-mcp-server
-npm install && npm run build
-
-# 2. Register with your AI client (auto-starts the server when needed)
-# Claude Code:
-claude mcp add --scope user juce-docs -- node "$(pwd)/dist/index.js"
-# Codex:
-codex mcp add juce-docs -- node "$(pwd)/dist/index.js"
+npm install
+npm run check
+npm run test:smoke
 ```
 
-No manual server process needed — the client starts and stops the server automatically.
+`npm run check` compiles the TypeScript, runs local regression tests, and
+checks for high-severity dependency advisories. The smoke test also exercises
+the configured live documentation source.
 
-You only need to run `npm run build` again after pulling or changing the source.
+## Recommended Codex setup: exact local JUCE version
 
-## Docs source options
-
-By default the server fetches from the official JUCE **master** docs. You can switch at any time using MCP tools:
-
-| Source | Tool call |
-|---|---|
-| Stable (master) | `set-juce-docs-source` with `{ "source": "master" }` |
-| Development | `set-juce-docs-source` with `{ "source": "develop" }` |
-| Custom URL | `set-juce-docs-source` with `{ "source": "custom-url", "url": "https://..." }` |
-| Local JUCE checkout | `setup-local-juce-docs` with `{ "jucePath": "~/Code/JUCE" }` |
-
-Local docs are faster (no network fetches) and follow whatever branch your JUCE checkout is on. Your choice is persisted across sessions in `~/.juce-docs-mcp-server/config.json`.
-
-### Setting the source via environment variables
-
-You can also set the docs source when registering the server, instead of calling tools later:
+Generate the documentation once if `docs/doxygen/doc/annotated.html` is not
+already present:
 
 ```bash
-# Claude Code — local docs
-claude mcp add --scope user juce-docs \
-  -e JUCE_DOCS_SOURCE=local-path \
-  -e JUCE_DOCS_LOCAL_PATH="$HOME/Code/JUCE/docs/doxygen/doc" \
-  -- node "$(pwd)/dist/index.js"
+cd "/path/to/JUCE/docs/doxygen"
+python3 build.py
+```
 
-# Codex — local docs
+Then register the STDIO server:
+
+```bash
 codex mcp add juce-docs \
   --env JUCE_DOCS_SOURCE=local-path \
-  --env JUCE_DOCS_LOCAL_PATH="$HOME/Code/JUCE/docs/doxygen/doc" \
-  -- node "$(pwd)/dist/index.js"
+  --env JUCE_DOCS_LOCAL_PATH="/path/to/JUCE/docs/doxygen/doc" \
+  --env JUCE_SOURCE_LOCAL_PATH="/path/to/JUCE" \
+  -- node "/path/to/juce-docs-mcp-server/dist/index.js"
 ```
 
-Available environment variables:
+Codex stores MCP configuration in its shared `config.toml`. A newly
+registered server becomes available to new client sessions; registering it
+does not inject tools into a session that is already running.
 
-| Variable | Description |
+## Documentation source options
+
+The default source is the official JUCE master documentation.
+
+| Source | Configuration |
 |---|---|
-| `JUCE_DOCS_SOURCE` | `master`, `develop`, `custom-url`, or `local-path` |
-| `JUCE_DOCS_BASE_URL` | URL for `custom-url` source |
-| `JUCE_DOCS_LOCAL_PATH` | Path for `local-path` source |
-| `JUCE_DOCS_CONFIG_PATH` | Custom config file location (default `~/.juce-docs-mcp-server/config.json`) |
+| Stable hosted docs | `JUCE_DOCS_SOURCE=master` |
+| Development hosted docs | `JUCE_DOCS_SOURCE=develop` |
+| Custom hosted docs | `JUCE_DOCS_SOURCE=custom-url` and `JUCE_DOCS_BASE_URL` |
+| Local generated docs | `JUCE_DOCS_SOURCE=local-path` and `JUCE_DOCS_LOCAL_PATH` |
+| Local source checkout | `JUCE_SOURCE_LOCAL_PATH=/path/to/JUCE` |
 
-## Cursor setup
+Runtime choices are persisted in
+`~/.juce-docs-mcp-server/config.json` unless environment variables override
+them. `JUCE_DOCS_CONFIG_PATH` selects a different config file.
 
-1. Open Cursor Settings > MCP
-2. Set the **Name** to `JUCE Docs` and **Type** to `Command`
-3. Set **Command** to `node /path/to/juce-docs-mcp-server/dist/index.js`
-4. Restart Cursor
+## MCP tools
 
-Cursor starts the server automatically — no separate process needed.
-
-## Visual Studio setup
-
-Visual Studio 2022/2026 with GitHub Copilot supports MCP. In the Copilot Chat window, click the wrench icon, then "+" to add an MCP server. Use this config in `.mcp.json`:
-
-```json
-{
-  "servers": {
-    "juce-docs": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["C:/path/to/juce-docs-mcp-server/dist/index.js"]
-    }
-  }
-}
-```
-
-## Available tools
-
-| Tool | Description |
+| Tool | Purpose |
 |---|---|
-| `search-juce-classes` | Search for JUCE classes by name |
-| `get-juce-class-docs` | Get documentation for a specific class |
-| `get-juce-docs-config` | Show current docs source configuration |
-| `set-juce-docs-source` | Switch docs source (master/develop/custom/local) |
-| `setup-local-juce-docs` | Point to a local JUCE checkout and optionally generate docs |
+| `search-juce-classes` | Search class names |
+| `get-juce-class-docs` | Retrieve one class and its documented members |
+| `search-juce-class-members` | Search methods/properties within one class |
+| `search-juce-source` | Search local JUCE source text |
+| `get-juce-source-file` | Read a bounded local source excerpt |
+| `get-juce-docs-config` | Inspect the resolved documentation/source setup |
+| `set-juce-docs-source` | Switch the documentation source |
+| `setup-local-juce-docs` | Locate or generate docs for a local JUCE checkout |
+
+The server also exposes `juce://classes` and
+`juce://class/{className}` resources.
 
 ## Development
 
 ```bash
-# Watch mode (auto-recompile on changes)
 npm run dev
-
-# Run tests
-npm test
-
-# Start server manually (for debugging)
-npm start
 ```
 
-See [README-DEV.md](./README-DEV.md) for developer notes.
+See [README-DEV.md](./README-DEV.md) for parser and test details.
 
 ## License
 
-MIT
+MIT. See [LICENSE](./LICENSE).

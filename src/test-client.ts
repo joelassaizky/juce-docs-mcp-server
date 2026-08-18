@@ -6,9 +6,22 @@ async function main() {
     console.log("Starting test client for JUCE Documentation MCP Server...");
     
     // Create a transport that communicates with the server process
+    const juceEnvironment = Object.fromEntries(
+      [
+        "JUCE_DOCS_SOURCE",
+        "JUCE_DOCS_BASE_URL",
+        "JUCE_DOCS_LOCAL_PATH",
+        "JUCE_SOURCE_LOCAL_PATH",
+        "JUCE_DOCS_CONFIG_PATH"
+      ]
+        .map((name) => [name, process.env[name]])
+        .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    );
+
     const transport = new StdioClientTransport({
       command: "node",
-      args: ["dist/index.js"]
+      args: ["dist/index.js"],
+      env: juceEnvironment
     });
     
     // Create an MCP client
@@ -18,10 +31,7 @@ async function main() {
         version: "1.0.0"
       },
       {
-        capabilities: {
-          resources: {},
-          tools: {}
-        }
+        capabilities: {}
       }
     );
     
@@ -42,16 +52,16 @@ async function main() {
     // Test reading the class list resource
     console.log("\nReading class list...");
     const classList = await client.readResource({ uri: "juce://classes" });
-    if (classList.contents && classList.contents[0] && classList.contents[0].text) {
-      const text = classList.contents[0].text as string;
+    if (classList.contents[0] && "text" in classList.contents[0]) {
+      const text = classList.contents[0].text;
       console.log("Class list:", text.substring(0, 200) + "...");
     }
     
     // Test reading a specific class resource
     console.log("\nReading ValueTree class documentation...");
     const valueTreeDocs = await client.readResource({ uri: "juce://class/ValueTree" });
-    if (valueTreeDocs.contents && valueTreeDocs.contents[0] && valueTreeDocs.contents[0].text) {
-      const text = valueTreeDocs.contents[0].text as string;
+    if (valueTreeDocs.contents[0] && "text" in valueTreeDocs.contents[0]) {
+      const text = valueTreeDocs.contents[0].text;
       console.log("ValueTree docs:", text.substring(0, 200) + "...");
     }
     
@@ -83,6 +93,36 @@ async function main() {
     const audioContent = audioDocs.content as Array<{type: string, text: string}>;
     if (audioContent && audioContent.length > 0) {
       console.log("AudioBuffer docs:", audioContent[0].text.substring(0, 200) + "...");
+    }
+
+    console.log("\nSearching AudioProcessorGraph members for 'addNode'...");
+    const memberSearch = await client.callTool({
+      name: "search-juce-class-members",
+      arguments: {
+        className: "AudioProcessorGraph",
+        query: "addNode"
+      }
+    });
+    const memberContent = memberSearch.content as Array<{type: string, text: string}>;
+    if (!memberContent[0]?.text.includes("addNode")) {
+      throw new Error("AudioProcessorGraph member search did not return addNode.");
+    }
+    console.log("Member search:", memberContent[0].text.substring(0, 200) + "...");
+
+    if (process.env.JUCE_SOURCE_LOCAL_PATH) {
+      console.log("\nSearching the local JUCE source tree...");
+      const sourceSearch = await client.callTool({
+        name: "search-juce-source",
+        arguments: {
+          query: "UpdateKind::none",
+          maxResults: 3
+        }
+      });
+      const sourceContent = sourceSearch.content as Array<{type: string, text: string}>;
+      if (!sourceContent[0]?.text.includes("UpdateKind::none")) {
+        throw new Error("Local JUCE source search did not return UpdateKind::none.");
+      }
+      console.log("Source search:", sourceContent[0].text.substring(0, 240) + "...");
     }
     
     console.log("\nAll tests completed successfully!");

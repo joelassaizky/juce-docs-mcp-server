@@ -5,7 +5,14 @@ import {
   fetchClassDocumentation,
   fetchClassList,
   searchClasses,
+  searchClassMembers,
+  searchJuceSource,
+  readJuceSourceFile,
   formatClassDocumentation,
+  formatMemberSearchResults,
+  formatSourceSearchResults,
+  formatSourceExcerpt,
+  decodeClassIdentifier,
   getDocsConfigPath,
   getDocsSourceConfig,
   setDocsSourceConfig,
@@ -15,7 +22,12 @@ import {
 // Create an MCP server
 const server = new McpServer({
   name: "JUCE Documentation Server",
-  version: "1.0.0"
+  version: "1.1.0"
+}, {
+  instructions:
+    "Use class documentation for public API semantics and local source lookup for implementation details. " +
+    "Prefer the configured local JUCE checkout so answers match the project's exact JUCE version. " +
+    "Search source before inferring thread, graph, plug-in-hosting, or CoreAudio behavior."
 });
 
 function formatDocsConfigMarkdown(config: Awaited<ReturnType<typeof getDocsSourceConfig>>): string {
@@ -33,6 +45,8 @@ function formatDocsConfigMarkdown(config: Awaited<ReturnType<typeof getDocsSourc
     lines.push("");
     lines.push("Tip: local docs are usually faster. Use `setup-local-juce-docs` with your JUCE path.");
   }
+
+  lines.push(`- Local JUCE Source: \`${config.localJucePath ?? "not configured"}\``);
 
   lines.push("");
   lines.push("Quick switches:");
@@ -87,7 +101,9 @@ server.resource(
     return {
       contents: [{
         uri: uri.href,
-        text: `# JUCE Classes\n\n${classes.map(c => `- [${c}](juce://class/${c})`).join('\n')}`
+        text: `# JUCE Classes\n\n${classes
+          .map((classId) => `- [${decodeClassIdentifier(classId)}](juce://class/${classId})`)
+          .join("\n")}`
       }]
     };
   }
@@ -113,7 +129,9 @@ server.tool(
       };
     }
     
-    const markdown = `# Search Results for '${query}'\n\n${results.map(c => `- [${c}](juce://class/${c})`).join('\n')}`;
+    const markdown = `# Search Results for '${query}'\n\n${results
+      .map((classId) => `- [${decodeClassIdentifier(classId)}](juce://class/${classId})`)
+      .join("\n")}`;
     
     return {
       content: [{ type: "text", text: markdown }]
@@ -150,6 +168,81 @@ server.tool(
 );
 
 server.tool(
+  "search-juce-class-members",
+  "Search methods and documented properties within one JUCE class.",
+  {
+    className: z.string(),
+    query: z.string()
+  },
+  async ({ className, query }) => {
+    const results = await searchClassMembers(className, query);
+    return {
+      content: [{
+        type: "text",
+        text: formatMemberSearchResults(className, query, results)
+      }]
+    };
+  }
+);
+
+server.tool(
+  "search-juce-source",
+  "Search the configured local JUCE checkout for exact source text. Defaults to modules only.",
+  {
+    query: z.string(),
+    caseSensitive: z.boolean().optional(),
+    maxResults: z.number().int().min(1).max(100).optional(),
+    scope: z.enum(["modules", "all"]).optional()
+  },
+  async ({ query, caseSensitive, maxResults, scope }) => {
+    try {
+      const results = await searchJuceSource(query, {
+        caseSensitive,
+        maxResults,
+        scope
+      });
+      return {
+        content: [{ type: "text", text: formatSourceSearchResults(query, results) }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `JUCE source search failed: ${error instanceof Error ? error.message : String(error)}`
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.tool(
+  "get-juce-source-file",
+  "Read a bounded line range from a C/C++/Objective-C file in the configured local JUCE checkout.",
+  {
+    path: z.string(),
+    startLine: z.number().int().min(1).optional(),
+    endLine: z.number().int().min(1).optional()
+  },
+  async ({ path, startLine, endLine }) => {
+    try {
+      const excerpt = await readJuceSourceFile(path, startLine, endLine);
+      return {
+        content: [{ type: "text", text: formatSourceExcerpt(excerpt) }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `JUCE source read failed: ${error instanceof Error ? error.message : String(error)}`
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.tool(
   "get-juce-docs-config",
   "Shows the current docs source (master/develop/custom/local), where it came from, and how to switch quickly.",
   {},
@@ -167,14 +260,16 @@ server.tool(
   {
     source: z.enum(["master", "develop", "custom-url", "local-path"]),
     url: z.string().optional(),
-    localDocsPath: z.string().optional()
+    localDocsPath: z.string().optional(),
+    localJucePath: z.string().optional()
   },
-  async ({ source, url, localDocsPath }) => {
+  async ({ source, url, localDocsPath, localJucePath }) => {
     try {
       const config = await setDocsSourceConfig({
         source,
         url,
-        localDocsPath
+        localDocsPath,
+        localJucePath
       });
       return {
         content: [{ type: "text", text: formatDocsConfigMarkdown(config) }]

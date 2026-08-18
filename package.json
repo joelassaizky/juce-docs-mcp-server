@@ -1,31 +1,36 @@
 {
   "name": "juce-docs-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for JUCE Framework documentation",
+  "version": "1.1.0",
+  "description": "MCP server for version-matched JUCE documentation and local source lookup",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc -w",
-    "test": "tsc && node dist/test-client.js"
+    "test": "tsc && node --test dist/*.test.js",
+    "test:smoke": "tsc && node dist/test-client.js",
+    "check": "npm run test && npm audit --audit-level=high"
   },
   "keywords": [
     "mcp",
     "juce",
     "documentation"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "Julius Smith and contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.18.1"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.6.1",
-    "cheerio": "^1.0.0-rc.12",
-    "node-fetch": "^2.6.9",
-    "zod": "^3.22.4"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "cheerio": "^1.2.0",
+    "node-fetch": "^2.7.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.10.5",
-    "@types/node-fetch": "^2.6.9",
-    "typescript": "^5.3.3"
+    "@types/node": "^20.19.43",
+    "@types/node-fetch": "^2.6.13",
+    "typescript": "^5.9.3"
   }
 }

@@ -2,7 +2,7 @@ import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, opendir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -19,12 +19,14 @@ interface PersistedDocsConfig {
   source?: DocsSourceType;
   customUrl?: string;
   localDocsPath?: string;
+  localJucePath?: string;
 }
 
 export interface DocsSourceConfig {
   source: DocsSourceType;
   baseUrl?: string;
   localDocsPath?: string;
+  localJucePath?: string;
   configPath: string;
   resolvedFrom: ConfigOrigin;
 }
@@ -33,12 +35,40 @@ export interface SetDocsSourceInput {
   source: DocsSourceType;
   url?: string;
   localDocsPath?: string;
+  localJucePath?: string;
 }
 
 export interface LocalDocsSetupResult {
   docsPath: string;
   generatedDocs: boolean;
   config: DocsSourceConfig;
+}
+
+export interface SourceSearchOptions {
+  caseSensitive?: boolean;
+  maxResults?: number;
+  scope?: "modules" | "all";
+}
+
+export interface SourceSearchResult {
+  file: string;
+  line: number;
+  column: number;
+  preview: string;
+}
+
+export interface SourceFileExcerpt {
+  file: string;
+  startLine: number;
+  endLine: number;
+  content: string;
+}
+
+export interface MemberSearchResult {
+  kind: "method" | "property";
+  name: string;
+  signature: string;
+  description: string;
 }
 
 /**
@@ -86,6 +116,10 @@ function getClassLeafName(classIdentifier: string): string {
   return segments[segments.length - 1];
 }
 
+export function decodeClassIdentifier(classIdentifier: string): string {
+  return classIdentifier.replace(/_1_1/g, "::");
+}
+
 function docsSourceCacheKey(config: DocsSourceConfig): string {
   if (config.source === "local-path") {
     return `local:${config.localDocsPath}`;
@@ -110,11 +144,16 @@ function parseEnvConfig(configPath: string): DocsSourceConfig | null {
   const sourceFromEnv = process.env.JUCE_DOCS_SOURCE?.trim().toLowerCase();
   const baseUrlFromEnv = process.env.JUCE_DOCS_BASE_URL?.trim();
   const localPathFromEnv = process.env.JUCE_DOCS_LOCAL_PATH?.trim();
+  const localJucePathFromEnv = process.env.JUCE_SOURCE_LOCAL_PATH?.trim();
 
   if (localPathFromEnv && localPathFromEnv.length > 0) {
+    const resolvedDocsPath = path.resolve(localPathFromEnv);
     return {
       source: "local-path",
-      localDocsPath: path.resolve(localPathFromEnv),
+      localDocsPath: resolvedDocsPath,
+      localJucePath: localJucePathFromEnv
+        ? path.resolve(localJucePathFromEnv)
+        : inferJucePathFromDocsPath(resolvedDocsPath),
       configPath,
       resolvedFrom: "env"
     };
@@ -124,6 +163,7 @@ function parseEnvConfig(configPath: string): DocsSourceConfig | null {
     return {
       source: "master",
       baseUrl: MASTER_BASE_URL,
+      localJucePath: localJucePathFromEnv ? path.resolve(localJucePathFromEnv) : undefined,
       configPath,
       resolvedFrom: "env"
     };
@@ -133,6 +173,7 @@ function parseEnvConfig(configPath: string): DocsSourceConfig | null {
     return {
       source: "develop",
       baseUrl: DEVELOP_BASE_URL,
+      localJucePath: localJucePathFromEnv ? path.resolve(localJucePathFromEnv) : undefined,
       configPath,
       resolvedFrom: "env"
     };
@@ -146,6 +187,7 @@ function parseEnvConfig(configPath: string): DocsSourceConfig | null {
     return {
       source: "custom-url",
       baseUrl: normalizeUrl(baseUrlFromEnv),
+      localJucePath: localJucePathFromEnv ? path.resolve(localJucePathFromEnv) : undefined,
       configPath,
       resolvedFrom: "env"
     };
@@ -165,11 +207,15 @@ function parseEnvConfig(configPath: string): DocsSourceConfig | null {
 
 function resolvePersistedConfig(configPath: string, persisted: PersistedDocsConfig | null): DocsSourceConfig {
   const source = persisted?.source ?? "master";
+  const localJucePath = persisted?.localJucePath
+    ? path.resolve(persisted.localJucePath)
+    : undefined;
 
   if (source === "develop") {
     return {
       source: "develop",
       baseUrl: DEVELOP_BASE_URL,
+      localJucePath,
       configPath,
       resolvedFrom: persisted ? "file" : "default"
     };
@@ -180,6 +226,7 @@ function resolvePersistedConfig(configPath: string, persisted: PersistedDocsConf
       return {
         source: "master",
         baseUrl: MASTER_BASE_URL,
+        localJucePath,
         configPath,
         resolvedFrom: "default"
       };
@@ -187,6 +234,7 @@ function resolvePersistedConfig(configPath: string, persisted: PersistedDocsConf
     return {
       source: "custom-url",
       baseUrl: normalizeUrl(persisted.customUrl),
+      localJucePath,
       configPath,
       resolvedFrom: "file"
     };
@@ -197,6 +245,7 @@ function resolvePersistedConfig(configPath: string, persisted: PersistedDocsConf
       return {
         source: "master",
         baseUrl: MASTER_BASE_URL,
+        localJucePath,
         configPath,
         resolvedFrom: "default"
       };
@@ -204,6 +253,7 @@ function resolvePersistedConfig(configPath: string, persisted: PersistedDocsConf
     return {
       source: "local-path",
       localDocsPath: path.resolve(persisted.localDocsPath),
+      localJucePath,
       configPath,
       resolvedFrom: "file"
     };
@@ -212,6 +262,7 @@ function resolvePersistedConfig(configPath: string, persisted: PersistedDocsConf
   return {
     source: "master",
     baseUrl: MASTER_BASE_URL,
+    localJucePath,
     configPath,
     resolvedFrom: persisted ? "file" : "default"
   };
@@ -246,6 +297,23 @@ async function ensureLocalDocsPathLooksValid(localDocsPath: string): Promise<voi
   }
 }
 
+async function ensureLocalJucePathLooksValid(localJucePath: string): Promise<void> {
+  const modulesPath = path.join(localJucePath, "modules");
+  if (!(await pathExists(modulesPath))) {
+    throw new Error(
+      `Local JUCE path does not look valid: '${localJucePath}' is missing the modules directory.`
+    );
+  }
+}
+
+function inferJucePathFromDocsPath(localDocsPath: string): string | undefined {
+  const suffix = path.join("docs", "doxygen", "doc");
+  const normalized = path.resolve(localDocsPath);
+  return normalized.endsWith(suffix)
+    ? normalized.slice(0, -(suffix.length + 1))
+    : undefined;
+}
+
 export function getDocsConfigPath(): string {
   return getConfigPath();
 }
@@ -270,23 +338,46 @@ export async function getDocsSourceConfig(): Promise<DocsSourceConfig> {
 export async function setDocsSourceConfig(input: SetDocsSourceInput): Promise<DocsSourceConfig> {
   const configPath = getConfigPath();
   let persisted: PersistedDocsConfig;
+  const currentConfig = activeConfig ?? resolvePersistedConfig(
+    configPath,
+    await loadPersistedConfig(configPath)
+  );
+  const explicitJucePath = input.localJucePath
+    ? path.resolve(input.localJucePath)
+    : currentConfig.localJucePath;
+
+  if (explicitJucePath) {
+    await ensureLocalJucePathLooksValid(explicitJucePath);
+  }
 
   if (input.source === "master") {
-    persisted = { source: "master" };
+    persisted = { source: "master", localJucePath: explicitJucePath };
   } else if (input.source === "develop") {
-    persisted = { source: "develop" };
+    persisted = { source: "develop", localJucePath: explicitJucePath };
   } else if (input.source === "custom-url") {
     if (!input.url) {
       throw new Error("A URL is required when source='custom-url'.");
     }
-    persisted = { source: "custom-url", customUrl: normalizeUrl(input.url) };
+    persisted = {
+      source: "custom-url",
+      customUrl: normalizeUrl(input.url),
+      localJucePath: explicitJucePath
+    };
   } else {
     if (!input.localDocsPath) {
       throw new Error("A local docs path is required when source='local-path'.");
     }
     const resolvedLocalPath = path.resolve(input.localDocsPath);
     await ensureLocalDocsPathLooksValid(resolvedLocalPath);
-    persisted = { source: "local-path", localDocsPath: resolvedLocalPath };
+    const inferredJucePath = explicitJucePath ?? inferJucePathFromDocsPath(resolvedLocalPath);
+    if (inferredJucePath) {
+      await ensureLocalJucePathLooksValid(inferredJucePath);
+    }
+    persisted = {
+      source: "local-path",
+      localDocsPath: resolvedLocalPath,
+      localJucePath: inferredJucePath
+    };
   }
 
   await savePersistedConfig(configPath, persisted);
@@ -400,7 +491,10 @@ export async function setupLocalDocsFromJucePath(
 
   const config = await setDocsSourceConfig({
     source: "local-path",
-    localDocsPath: docsPathToUse
+    localDocsPath: docsPathToUse,
+    localJucePath: await pathExists(path.join(resolvedInput, "modules"))
+      ? resolvedInput
+      : inferJucePathFromDocsPath(docsPathToUse)
   });
 
   return { docsPath: docsPathToUse, generatedDocs, config };
@@ -456,6 +550,21 @@ async function fetchHtml(relativePath: string, allowNotFound = false): Promise<H
 /**
  * Fetches the list of all JUCE classes from the index page
  */
+export function parseClassListHtml(html: string): string[] {
+  const $ = cheerio.load(html);
+  const classes: string[] = [];
+
+  $(".directory tr.even, .directory tr.odd").each((_, element) => {
+    const link = $(element).find("td.entry a");
+    const href = link.attr("href");
+    if (href && href.startsWith("class") && href.endsWith(".html")) {
+      classes.push(href.replace(/^class/, "").replace(/\.html$/, ""));
+    }
+  });
+
+  return [...new Set(classes)];
+}
+
 export async function fetchClassList(): Promise<string[]> {
   try {
     const config = await getDocsSourceConfig();
@@ -470,21 +579,7 @@ export async function fetchClassList(): Promise<string[]> {
       throw new Error("Failed to load annotated.html");
     }
 
-    const $ = cheerio.load(html);
-
-    // Extract class names from the class list page
-    const classes: string[] = [];
-
-    // Look for links in the class list
-    $(".directory tr.even, .directory tr.odd").each((_, element) => {
-      const link = $(element).find("td.entry a");
-      const href = link.attr("href");
-      if (href && href.startsWith("class") && href.endsWith(".html")) {
-        // Extract class name from href (e.g., "classValueTree.html" -> "ValueTree")
-        const className = href.replace(/^class/, "").replace(/\.html$/, "");
-        classes.push(className);
-      }
-    });
+    const classes = parseClassListHtml(html);
 
     classListCache = { key: cacheKey, classes };
     return classes;
@@ -492,6 +587,53 @@ export async function fetchClassList(): Promise<string[]> {
     console.error("Error fetching class list:", error);
     throw error;
   }
+}
+
+export function parseClassDocumentationHtml(
+  classIdentifier: string,
+  classDocUrl: string,
+  html: string
+): ClassDocumentation {
+  const $ = cheerio.load(html);
+  const description = $(".contents .textblock").first().text().trim();
+  const methods: MethodDocumentation[] = [];
+
+  $(".memitem").each((_, element) => {
+    const nameElement = $(element).find(".memname");
+    if (!nameElement.length) {
+      return;
+    }
+
+    const name = nameElement.text().trim().split("(")[0].trim();
+    const signature = nameElement.parent().text().replace(/\s+/g, " ").trim();
+    const methodDescription = $(element).find(".memdoc").text().replace(/\s+/g, " ").trim();
+    methods.push({ name, signature, description: methodDescription });
+  });
+
+  const properties: PropertyDocumentation[] = [];
+  $(".fieldtable tr").each((_, element) => {
+    const nameElement = $(element).find(".fieldname");
+    if (!nameElement.length) {
+      return;
+    }
+
+    properties.push({
+      name: nameElement.text().trim(),
+      type: $(element).find(".fieldtype").text().trim(),
+      description: $(element).find(".fielddoc").text().replace(/\s+/g, " ").trim()
+    });
+  });
+
+  const inheritance = $(".inheritance").first().text().replace(/\s+/g, " ").trim() || undefined;
+
+  return {
+    className: decodeClassIdentifier(classIdentifier),
+    description,
+    methods,
+    properties,
+    inheritance,
+    url: classDocUrl
+  };
 }
 
 async function resolveClassIdentifier(className: string): Promise<string> {
@@ -540,59 +682,7 @@ export async function fetchClassDocumentation(className: string): Promise<ClassD
       return null;
     }
 
-    const $ = cheerio.load(classHtml);
-
-    // Extract class description
-    const description = $(".contents .textblock").first().text().trim();
-
-    // Extract methods
-    const methods: MethodDocumentation[] = [];
-    $(".memitem").each((_, element) => {
-      const nameElement = $(element).find(".memname");
-      if (nameElement.length) {
-        const name = nameElement.text().trim().split("(")[0].trim();
-        const signature = nameElement.parent().text().trim();
-        const methodDescription = $(element).find(".memdoc").text().trim();
-
-        methods.push({
-          name,
-          signature,
-          description: methodDescription
-        });
-      }
-    });
-
-    // Extract properties (this is simplified and might need adjustment)
-    const properties: PropertyDocumentation[] = [];
-    $(".fieldtable tr").each((_, element) => {
-      const nameElement = $(element).find(".fieldname");
-      if (nameElement.length) {
-        const name = nameElement.text().trim();
-        const type = $(element).find(".fieldtype").text().trim();
-        const propertyDescription = $(element).find(".fielddoc").text().trim();
-
-        properties.push({
-          name,
-          type,
-          description: propertyDescription
-        });
-      }
-    });
-
-    // Extract inheritance information
-    let inheritance: string | undefined;
-    $(".inheritance").each((_, element) => {
-      inheritance = $(element).text().trim();
-    });
-
-    return {
-      className: resolvedClassId,
-      description,
-      methods,
-      properties,
-      inheritance,
-      url: classDocUrl
-    };
+    return parseClassDocumentationHtml(resolvedClassId, classDocUrl, classHtml);
   } catch (error) {
     console.error(`Error fetching documentation for ${className}:`, error);
     return null;
@@ -612,6 +702,384 @@ export async function searchClasses(query: string): Promise<string[]> {
     console.error("Error searching classes:", error);
     throw error;
   }
+}
+
+export async function searchClassMembers(
+  className: string,
+  query: string
+): Promise<MemberSearchResult[]> {
+  const doc = await fetchClassDocumentation(className);
+  if (!doc) {
+    return [];
+  }
+
+  const needle = query.trim().toLowerCase();
+  if (!needle) {
+    return [];
+  }
+
+  const methods: MemberSearchResult[] = doc.methods
+    .filter((method) =>
+      [method.name, method.signature, method.description]
+        .some((value) => value.toLowerCase().includes(needle))
+    )
+    .map((method) => ({
+      kind: "method",
+      name: method.name,
+      signature: method.signature,
+      description: method.description
+    }));
+
+  const properties: MemberSearchResult[] = doc.properties
+    .filter((property) =>
+      [property.name, property.type, property.description]
+        .some((value) => value.toLowerCase().includes(needle))
+    )
+    .map((property) => ({
+      kind: "property",
+      name: property.name,
+      signature: property.type,
+      description: property.description
+    }));
+
+  return [...methods, ...properties];
+}
+
+const SOURCE_EXTENSIONS = new Set([
+  ".c",
+  ".cc",
+  ".cpp",
+  ".cxx",
+  ".h",
+  ".hh",
+  ".hpp",
+  ".inl",
+  ".m",
+  ".mm"
+]);
+
+const EXCLUDED_SOURCE_DIRECTORIES = new Set([
+  ".git",
+  "build",
+  "Builds",
+  "cmake-build-debug",
+  "cmake-build-release",
+  "node_modules"
+]);
+
+async function requireLocalJucePath(): Promise<string> {
+  const config = await getDocsSourceConfig();
+  if (!config.localJucePath) {
+    throw new Error(
+      "JUCE source lookup requires a local JUCE checkout. " +
+      "Run setup-local-juce-docs or set JUCE_SOURCE_LOCAL_PATH."
+    );
+  }
+
+  await ensureLocalJucePathLooksValid(config.localJucePath);
+  return config.localJucePath;
+}
+
+async function* walkSourceFiles(directory: string): AsyncGenerator<string> {
+  const entries = await opendir(directory);
+  for await (const entry of entries) {
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
+
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (!EXCLUDED_SOURCE_DIRECTORIES.has(entry.name)) {
+        yield* walkSourceFiles(entryPath);
+      }
+      continue;
+    }
+
+    if (entry.isFile() && SOURCE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+      yield entryPath;
+    }
+  }
+}
+
+function clampResultCount(value: number | undefined): number {
+  return Math.max(1, Math.min(value ?? 20, 100));
+}
+
+async function searchSourceTreeWithRipgrep(
+  rootPath: string,
+  searchRoot: string,
+  query: string,
+  options: SourceSearchOptions,
+  maxResults: number
+): Promise<SourceSearchResult[] | null> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "--json",
+      "--fixed-strings",
+      "--max-filesize",
+      "4M",
+      options.caseSensitive ? "--case-sensitive" : "--ignore-case",
+      "--glob",
+      "*.{c,cc,cpp,cxx,h,hh,hpp,inl,m,mm}",
+      "--glob",
+      "!build/**",
+      "--glob",
+      "!Builds/**",
+      "--glob",
+      "!node_modules/**",
+      "--",
+      query,
+      searchRoot
+    ];
+    const child = spawn("rg", args, { shell: false });
+    const results: SourceSearchResult[] = [];
+    let buffered = "";
+    let settled = false;
+
+    const finish = (value: SourceSearchResult[] | null): void => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+
+    const processLine = (line: string): void => {
+      if (!line || results.length >= maxResults) {
+        return;
+      }
+
+      let event: {
+        type?: string;
+        data?: {
+          path?: { text?: string };
+          line_number?: number;
+          lines?: { text?: string };
+          submatches?: Array<{ start?: number }>;
+        };
+      };
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      if (event.type !== "match") {
+        return;
+      }
+
+      const filePath = event.data?.path?.text;
+      const lineNumber = event.data?.line_number;
+      const preview = event.data?.lines?.text;
+      if (!filePath || !lineNumber || preview === undefined) {
+        return;
+      }
+
+      results.push({
+        file: path.relative(rootPath, filePath).split(path.sep).join("/"),
+        line: lineNumber,
+        column: (event.data?.submatches?.[0]?.start ?? 0) + 1,
+        preview: preview.trim().slice(0, 500)
+      });
+
+      if (results.length >= maxResults) {
+        child.kill();
+      }
+    };
+
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (chunk: string) => {
+      buffered += chunk;
+      const lines = buffered.split("\n");
+      buffered = lines.pop() ?? "";
+      lines.forEach(processLine);
+    });
+
+    child.stderr.on("data", () => {
+      // Ripgrep diagnostics are handled by its exit status.
+    });
+
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        finish(null);
+      } else {
+        reject(error);
+      }
+    });
+
+    child.on("close", (code) => {
+      processLine(buffered);
+      if (settled) {
+        return;
+      }
+      if (code === 0 || code === 1 || results.length >= maxResults) {
+        finish(results);
+      } else {
+        reject(new Error(`ripgrep source search exited with code ${code ?? "unknown"}.`));
+      }
+    });
+  });
+}
+
+export async function searchSourceTree(
+  jucePath: string,
+  query: string,
+  options: SourceSearchOptions = {}
+): Promise<SourceSearchResult[]> {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    throw new Error("Source search query must not be empty.");
+  }
+
+  const rootPath = await realpath(jucePath);
+  await ensureLocalJucePathLooksValid(rootPath);
+  const searchRoot = options.scope === "all"
+    ? rootPath
+    : path.join(rootPath, "modules");
+  const needle = options.caseSensitive ? trimmedQuery : trimmedQuery.toLowerCase();
+  const maxResults = clampResultCount(options.maxResults);
+  const ripgrepResults = await searchSourceTreeWithRipgrep(
+    rootPath,
+    searchRoot,
+    trimmedQuery,
+    options,
+    maxResults
+  );
+  if (ripgrepResults) {
+    return ripgrepResults;
+  }
+
+  const results: SourceSearchResult[] = [];
+
+  for await (const filePath of walkSourceFiles(searchRoot)) {
+    const fileStats = await stat(filePath);
+    if (fileStats.size > 4 * 1024 * 1024) {
+      continue;
+    }
+
+    const contents = await readFile(filePath, "utf-8");
+    const lines = contents.split(/\r?\n/);
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const haystack = options.caseSensitive ? lines[lineIndex] : lines[lineIndex].toLowerCase();
+      const column = haystack.indexOf(needle);
+      if (column < 0) {
+        continue;
+      }
+
+      results.push({
+        file: path.relative(rootPath, filePath).split(path.sep).join("/"),
+        line: lineIndex + 1,
+        column: column + 1,
+        preview: lines[lineIndex].trim().slice(0, 500)
+      });
+
+      if (results.length >= maxResults) {
+        return results;
+      }
+    }
+  }
+
+  return results;
+}
+
+export async function searchJuceSource(
+  query: string,
+  options: SourceSearchOptions = {}
+): Promise<SourceSearchResult[]> {
+  return searchSourceTree(await requireLocalJucePath(), query, options);
+}
+
+function validateSourceRelativePath(relativePath: string): void {
+  if (
+    path.isAbsolute(relativePath) ||
+    relativePath.split(/[\\/]+/).some((part) => part === ".." || part.startsWith("."))
+  ) {
+    throw new Error("Source file path must stay within the configured JUCE checkout.");
+  }
+
+  if (!SOURCE_EXTENSIONS.has(path.extname(relativePath).toLowerCase())) {
+    throw new Error("Source file must be a C, C++, Objective-C, or header file.");
+  }
+}
+
+export async function readSourceFileFromTree(
+  jucePath: string,
+  relativePath: string,
+  startLine = 1,
+  endLine?: number
+): Promise<SourceFileExcerpt> {
+  validateSourceRelativePath(relativePath);
+  const rootPath = await realpath(jucePath);
+  const requestedPath = await realpath(path.resolve(rootPath, relativePath));
+  const rootPrefix = rootPath.endsWith(path.sep) ? rootPath : `${rootPath}${path.sep}`;
+  if (!requestedPath.startsWith(rootPrefix)) {
+    throw new Error("Source file path escapes the configured JUCE checkout.");
+  }
+
+  const fileStats = await stat(requestedPath);
+  if (!fileStats.isFile() || fileStats.size > 4 * 1024 * 1024) {
+    throw new Error("Source file is unavailable or exceeds the 4 MiB read limit.");
+  }
+
+  const lines = (await readFile(requestedPath, "utf-8")).split(/\r?\n/);
+  const safeStart = Math.max(1, Math.min(startLine, Math.max(lines.length, 1)));
+  const requestedEnd = endLine ?? Math.min(safeStart + 199, lines.length);
+  const safeEnd = Math.max(safeStart, Math.min(requestedEnd, safeStart + 399, lines.length));
+
+  return {
+    file: path.relative(rootPath, requestedPath).split(path.sep).join("/"),
+    startLine: safeStart,
+    endLine: safeEnd,
+    content: lines.slice(safeStart - 1, safeEnd).join("\n")
+  };
+}
+
+export async function readJuceSourceFile(
+  relativePath: string,
+  startLine = 1,
+  endLine?: number
+): Promise<SourceFileExcerpt> {
+  return readSourceFileFromTree(
+    await requireLocalJucePath(),
+    relativePath,
+    startLine,
+    endLine
+  );
+}
+
+export function formatMemberSearchResults(
+  className: string,
+  query: string,
+  results: MemberSearchResult[]
+): string {
+  if (results.length === 0) {
+    return `No members of '${className}' matched '${query}'.`;
+  }
+
+  const body = results.map((result) =>
+    `### ${result.name} (${result.kind})\n\n` +
+    `\`\`\`cpp\n${result.signature}\n\`\`\`\n\n` +
+    result.description
+  ).join("\n\n");
+  return `# Members of ${className} matching '${query}'\n\n${body}`;
+}
+
+export function formatSourceSearchResults(
+  query: string,
+  results: SourceSearchResult[]
+): string {
+  if (results.length === 0) {
+    return `No JUCE source lines matched '${query}'.`;
+  }
+
+  return `# JUCE source matches for '${query}'\n\n` +
+    results.map((result) =>
+      `- \`${result.file}:${result.line}:${result.column}\` — \`${result.preview}\``
+    ).join("\n");
+}
+
+export function formatSourceExcerpt(excerpt: SourceFileExcerpt): string {
+  return `# ${excerpt.file}\n\nLines ${excerpt.startLine}-${excerpt.endLine}\n\n` +
+    `\`\`\`cpp\n${excerpt.content}\n\`\`\``;
 }
 
 /**
@@ -647,4 +1115,3 @@ export function formatClassDocumentation(doc: ClassDocumentation): string {
 
   return markdown;
 }
-
